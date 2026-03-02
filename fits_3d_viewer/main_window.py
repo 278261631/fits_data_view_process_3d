@@ -99,6 +99,10 @@ class MainWindow(QMainWindow):
         self._act_compare_original.toggled.connect(self._on_compare_original_toggled)
         tb.addAction(self._act_compare_original)
 
+        act_clip_negative = QAction("负值置零", self)
+        act_clip_negative.triggered.connect(self._clip_negative_in_current_view)
+        tb.addAction(act_clip_negative)
+
         self._image_name_label = QLabel("  显示: --")
         tb.addWidget(self._image_name_label)
 
@@ -326,6 +330,40 @@ class MainWindow(QMainWindow):
     def _on_compare_original_toggled(self, on: bool) -> None:
         self._compare_original = bool(on)
         self._recompute_background_view()
+
+    def _clip_negative_in_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可处理")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可处理")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        neg_mask = np.isfinite(target) & (target < 0.0)
+        neg_count = int(np.count_nonzero(neg_mask))
+        if neg_count <= 0:
+            self.statusBar().showMessage(f"{target_name} 图像中无负值像素")
+            return
+
+        clipped = np.array(target, copy=True)
+        clipped[neg_mask] = 0.0
+
+        if showing_aligned:
+            self._disp_aligned = clipped
+        else:
+            self._disp_ref = clipped
+        self._canvas.load_base_gray8(to_uint8_view(clipped), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self.statusBar().showMessage(f"{target_name} 负值置零完成: {neg_count} 个像素")
 
     def _load_reference(self, path: Path) -> None:
         img = read_fits_image(path)

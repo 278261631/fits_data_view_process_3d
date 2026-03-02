@@ -85,6 +85,9 @@ class ImageCanvas(QGraphicsView):
     def current_base_name(self) -> str:
         return "aligned" if self._showing_b else "reference"
 
+    def is_showing_aligned(self) -> bool:
+        return self._showing_b
+
     def _show_base(self, gray8: np.ndarray) -> None:
         qimg = gray8_to_qimage(gray8)
         self._base_item.setPixmap(QPixmap.fromImage(qimg))
