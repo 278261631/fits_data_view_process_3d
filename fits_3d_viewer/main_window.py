@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -32,8 +34,8 @@ from fits_3d_viewer.background import (
 )
 from fits_3d_viewer.canvas import ImageCanvas
 from fits_3d_viewer.config import AppConfig
-from fits_3d_viewer.file_browser import FileBrowser, TileGroup
-from fits_3d_viewer.fits_io import read_fits_image, to_uint8_view
+from fits_3d_viewer.file_browser import FileBrowser, TileGroup, discover_tiles
+from fits_3d_viewer.fits_io import read_fits_image, to_uint8_view, write_fits_image
 from fits_3d_viewer.view3d import Dual3DView
 
 
@@ -102,6 +104,10 @@ class MainWindow(QMainWindow):
         act_clip_negative = QAction("负值置零", self)
         act_clip_negative.triggered.connect(self._clip_negative_in_current_view)
         tb.addAction(act_clip_negative)
+
+        act_batch_export = QAction("批量处理导出", self)
+        act_batch_export.triggered.connect(self._batch_process_and_export)
+        tb.addAction(act_batch_export)
 
         self._image_name_label = QLabel("  显示: --")
         tb.addWidget(self._image_name_label)
@@ -364,6 +370,62 @@ class MainWindow(QMainWindow):
         self._canvas.load_base_gray8(to_uint8_view(clipped), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
         self.statusBar().showMessage(f"{target_name} 负值置零完成: {neg_count} 个像素")
+
+    def _batch_process_and_export(self) -> None:
+        if not self._cfg.data_dir:
+            QMessageBox.warning(self, "批量处理导出", "请先设置数据目录。")
+            return
+
+        input_root = Path(self._cfg.data_dir)
+        if not input_root.exists() or not input_root.is_dir():
+            QMessageBox.warning(self, "批量处理导出", "数据目录不存在或不可访问。")
+            return
+
+        output_root = input_root / datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        tiles = discover_tiles(input_root)
+        input_files: list[Path] = []
+        for t in tiles:
+            if t.reference is not None and t.reference.is_file():
+                input_files.append(t.reference)
+        if not input_files:
+            QMessageBox.information(self, "批量处理导出", "未发现可处理的 FITS 文件。")
+            return
+
+        method = self._active_bg_method
+        params = self._params_for_method(method)
+        ok_count = 0
+        fail_count = 0
+
+        for idx, in_path in enumerate(input_files, start=1):
+            try:
+                img = read_fits_image(in_path)
+                arr = np.squeeze(img.data).astype(np.float64)
+                processed = remove_background_with_params(arr, method=method, params=params)
+                clipped = np.array(processed, copy=True)
+                neg_mask = np.isfinite(clipped) & (clipped < 0.0)
+                clipped[neg_mask] = 0.0
+
+                try:
+                    rel = in_path.relative_to(input_root)
+                except ValueError:
+                    rel = Path(in_path.name)
+                out_path = output_root / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                write_fits_image(out_path, clipped, header=img.header, overwrite=True)
+                ok_count += 1
+            except Exception:
+                fail_count += 1
+            self.statusBar().showMessage(
+                f"批量处理中: {idx}/{len(input_files)} | 方法: {method} | 已完成: {ok_count} | 失败: {fail_count}"
+            )
+
+        QMessageBox.information(
+            self,
+            "批量处理导出完成",
+            f"方法: {method}\n总文件: {len(input_files)}\n成功: {ok_count}\n失败: {fail_count}\n导出目录: {output_root}",
+        )
 
     def _load_reference(self, path: Path) -> None:
         img = read_fits_image(path)
