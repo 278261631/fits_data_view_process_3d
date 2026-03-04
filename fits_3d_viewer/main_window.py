@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from astropy.convolution import Gaussian2DKernel, convolve_fft
+from numpy.lib.stride_tricks import sliding_window_view
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -109,6 +110,10 @@ class MainWindow(QMainWindow):
         act_gaussian_smooth = QAction("高斯平滑", self)
         act_gaussian_smooth.triggered.connect(self._gaussian_smooth_current_view)
         tb.addAction(act_gaussian_smooth)
+
+        act_median_filter = QAction("中值滤波", self)
+        act_median_filter.triggered.connect(self._median_filter_current_view)
+        tb.addAction(act_median_filter)
 
         act_batch_export = QAction("批量处理导出", self)
         act_batch_export.triggered.connect(self._batch_process_and_export)
@@ -413,6 +418,53 @@ class MainWindow(QMainWindow):
         self._canvas.load_base_gray8(to_uint8_view(smoothed), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
         self.statusBar().showMessage(f"{target_name} 高斯平滑完成 (sigma={sigma})")
+
+    def _median_filter_2d(self, data: np.ndarray, ksize: int = 3) -> np.ndarray:
+        k = int(ksize)
+        if k < 1:
+            k = 1
+        if k % 2 == 0:
+            k += 1
+        if data.ndim != 2:
+            return np.asarray(data, dtype=np.float64)
+
+        arr = np.asarray(data, dtype=np.float64)
+        if not np.isfinite(arr).all():
+            fill_val = float(np.nanmedian(arr)) if np.isfinite(arr).any() else 0.0
+            arr = np.array(arr, copy=True)
+            arr[~np.isfinite(arr)] = fill_val
+
+        pad = k // 2
+        padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="edge")
+        windows = sliding_window_view(padded, (k, k))
+        return np.nanmedian(windows, axis=(-2, -1))
+
+    def _median_filter_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+        ksize = 3
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可滤波")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可滤波")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        filtered = self._median_filter_2d(target, ksize=ksize)
+        if showing_aligned:
+            self._disp_aligned = filtered
+        else:
+            self._disp_ref = filtered
+        self._canvas.load_base_gray8(to_uint8_view(filtered), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self.statusBar().showMessage(f"{target_name} 中值滤波完成 (ksize={ksize})")
 
     def _batch_process_and_export(self) -> None:
         if not self._cfg.data_dir:
