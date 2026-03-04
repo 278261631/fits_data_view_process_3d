@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from astropy.convolution import Gaussian2DKernel, convolve_fft
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -104,6 +105,10 @@ class MainWindow(QMainWindow):
         act_clip_negative = QAction("负值置零", self)
         act_clip_negative.triggered.connect(self._clip_negative_in_current_view)
         tb.addAction(act_clip_negative)
+
+        act_gaussian_smooth = QAction("高斯平滑", self)
+        act_gaussian_smooth.triggered.connect(self._gaussian_smooth_current_view)
+        tb.addAction(act_gaussian_smooth)
 
         act_batch_export = QAction("批量处理导出", self)
         act_batch_export.triggered.connect(self._batch_process_and_export)
@@ -370,6 +375,44 @@ class MainWindow(QMainWindow):
         self._canvas.load_base_gray8(to_uint8_view(clipped), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
         self.statusBar().showMessage(f"{target_name} 负值置零完成: {neg_count} 个像素")
+
+    def _gaussian_smooth_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+        sigma = 1.5
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可平滑")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可平滑")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        fill_val = float(np.nanmedian(target)) if np.isfinite(target).any() else 0.0
+        smoothed = np.asarray(
+            convolve_fft(
+                target,
+                Gaussian2DKernel(sigma),
+                normalize_kernel=True,
+                boundary="fill",
+                fill_value=fill_val,
+            ),
+            dtype=np.float64,
+        )
+
+        if showing_aligned:
+            self._disp_aligned = smoothed
+        else:
+            self._disp_ref = smoothed
+        self._canvas.load_base_gray8(to_uint8_view(smoothed), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self.statusBar().showMessage(f"{target_name} 高斯平滑完成 (sigma={sigma})")
 
     def _batch_process_and_export(self) -> None:
         if not self._cfg.data_dir:
