@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPen, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QPainterPath, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from fits_3d_viewer.qt_image import gray8_to_qimage
@@ -34,6 +34,12 @@ class ImageCanvas(QGraphicsView):
         self._region_rect = self._scene.addRect(QRectF(), rect_pen, Qt.BrushStyle.NoBrush)
         self._region_rect.setZValue(99)
         self._region_rect.setVisible(False)
+
+        mark_pen = QPen(QColor(0, 255, 0, 220), 1.5)
+        mark_pen.setCosmetic(True)
+        self._modified_mark_item = self._scene.addPath(QPainterPath(), mark_pen, Qt.BrushStyle.NoBrush)
+        self._modified_mark_item.setZValue(120)
+        self._modified_mark_item.setVisible(False)
 
         self._mode: str = "view3d"
 
@@ -88,6 +94,34 @@ class ImageCanvas(QGraphicsView):
     def is_showing_aligned(self) -> bool:
         return self._showing_b
 
+    def clear_modified_markers(self) -> None:
+        self._modified_mark_item.setPath(QPainterPath())
+        self._modified_mark_item.setVisible(False)
+
+    def show_modified_pixels(self, mask: np.ndarray, max_markers: int = 6000, radius: float = 2.0) -> int:
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim != 2 or arr.size == 0:
+            self.clear_modified_markers()
+            return 0
+        ys, xs = np.nonzero(arr)
+        total = int(xs.size)
+        if total <= 0:
+            self.clear_modified_markers()
+            return 0
+
+        if total > int(max_markers):
+            sel_idx = np.linspace(0, total - 1, int(max_markers), dtype=int)
+            xs = xs[sel_idx]
+            ys = ys[sel_idx]
+
+        r = max(1.0, float(radius))
+        path = QPainterPath()
+        for x, y in zip(xs.tolist(), ys.tolist()):
+            path.addEllipse(QRectF(float(x) - r, float(y) - r, 2.0 * r, 2.0 * r))
+        self._modified_mark_item.setPath(path)
+        self._modified_mark_item.setVisible(True)
+        return int(xs.size)
+
     def _show_base(self, gray8: np.ndarray) -> None:
         qimg = gray8_to_qimage(gray8)
         self._base_item.setPixmap(QPixmap.fromImage(qimg))
@@ -103,6 +137,7 @@ class ImageCanvas(QGraphicsView):
         self._showing_b = False
         self._base_item.setPixmap(QPixmap())
         self._region_rect.setVisible(False)
+        self.clear_modified_markers()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()

@@ -127,6 +127,10 @@ class MainWindow(QMainWindow):
         act_lift_dark_weak.triggered.connect(self._lift_dark_weak_pixels_current_view)
         tb.addAction(act_lift_dark_weak)
 
+        act_tophat_replace = QAction("Tophat替换小目标", self)
+        act_tophat_replace.triggered.connect(self._tophat_replace_current_view)
+        tb.addAction(act_tophat_replace)
+
         act_batch_export = QAction("批量处理导出", self)
         act_batch_export.triggered.connect(self._batch_process_and_export)
         tb.addAction(act_batch_export)
@@ -367,6 +371,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         print(f"[FITS3D] {message}", flush=True)
 
+    def _mark_modified_pixels(self, mask: np.ndarray) -> int:
+        return self._canvas.show_modified_pixels(mask)
+
     def _clip_negative_in_current_view(self) -> None:
         showing_aligned = self._canvas.is_showing_aligned()
         target_name = "aligned" if showing_aligned else "reference"
@@ -387,6 +394,7 @@ class MainWindow(QMainWindow):
         neg_mask = np.isfinite(target) & (target < 0.0)
         neg_count = int(np.count_nonzero(neg_mask))
         if neg_count <= 0:
+            self._canvas.clear_modified_markers()
             self._set_op_status(f"{target_name} 图像中无负值像素")
             return
 
@@ -399,7 +407,8 @@ class MainWindow(QMainWindow):
             self._disp_ref = clipped
         self._canvas.load_base_gray8(to_uint8_view(clipped), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self._set_op_status(f"{target_name} 负值置零完成: {neg_count} 个像素")
+        marked = self._mark_modified_pixels(neg_mask)
+        self._set_op_status(f"{target_name} 负值置零完成: {neg_count} 个像素 | 标记: {marked} 个")
 
     def _gaussian_smooth_current_view(self) -> None:
         showing_aligned = self._canvas.is_showing_aligned()
@@ -430,6 +439,7 @@ class MainWindow(QMainWindow):
             ),
             dtype=np.float64,
         )
+        changed_mask = np.isfinite(target) & np.isfinite(smoothed) & (~np.isclose(smoothed, target))
 
         if showing_aligned:
             self._disp_aligned = smoothed
@@ -437,7 +447,8 @@ class MainWindow(QMainWindow):
             self._disp_ref = smoothed
         self._canvas.load_base_gray8(to_uint8_view(smoothed), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self._set_op_status(f"{target_name} 高斯平滑完成 (sigma={sigma})")
+        marked = self._mark_modified_pixels(changed_mask)
+        self._set_op_status(f"{target_name} 高斯平滑完成 (sigma={sigma}) | 标记: {marked} 个")
 
     def _median_filter_2d(self, data: np.ndarray, ksize: int = 3) -> np.ndarray:
         k = int(ksize)
@@ -478,13 +489,15 @@ class MainWindow(QMainWindow):
             slot = "a"
 
         filtered = self._median_filter_2d(target, ksize=ksize)
+        changed_mask = np.isfinite(target) & np.isfinite(filtered) & (~np.isclose(filtered, target))
         if showing_aligned:
             self._disp_aligned = filtered
         else:
             self._disp_ref = filtered
         self._canvas.load_base_gray8(to_uint8_view(filtered), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self._set_op_status(f"{target_name} 中值滤波完成 (ksize={ksize})")
+        marked = self._mark_modified_pixels(changed_mask)
+        self._set_op_status(f"{target_name} 中值滤波完成 (ksize={ksize}) | 标记: {marked} 个")
 
     def _adaptive_hist_eq_2d(self, data: np.ndarray, tile_size: int = 64, clip_limit: float = 0.02) -> np.ndarray:
         arr = np.asarray(data, dtype=np.float64)
@@ -558,14 +571,16 @@ class MainWindow(QMainWindow):
             slot = "a"
 
         eq = self._adaptive_hist_eq_2d(target, tile_size=tile_size, clip_limit=clip_limit)
+        changed_mask = np.isfinite(target) & np.isfinite(eq) & (~np.isclose(eq, target))
         if showing_aligned:
             self._disp_aligned = eq
         else:
             self._disp_ref = eq
         self._canvas.load_base_gray8(to_uint8_view(eq), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        marked = self._mark_modified_pixels(changed_mask)
         self._set_op_status(
-            f"{target_name} 自适应直方图均衡化完成 (tile={tile_size}, clip={clip_limit})"
+            f"{target_name} 自适应直方图均衡化完成 (tile={tile_size}, clip={clip_limit}) | 标记: {marked} 个"
         )
 
     def _gamma_correct_2d(self, data: np.ndarray, gamma: float = 1.2) -> np.ndarray:
@@ -611,13 +626,15 @@ class MainWindow(QMainWindow):
             slot = "a"
 
         corrected = self._gamma_correct_2d(target, gamma=gamma)
+        changed_mask = np.isfinite(target) & np.isfinite(corrected) & (~np.isclose(corrected, target))
         if showing_aligned:
             self._disp_aligned = corrected
         else:
             self._disp_ref = corrected
         self._canvas.load_base_gray8(to_uint8_view(corrected), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self._set_op_status(f"{target_name} Gamma校正完成 (gamma={gamma})")
+        marked = self._mark_modified_pixels(changed_mask)
+        self._set_op_status(f"{target_name} Gamma校正完成 (gamma={gamma}) | 标记: {marked} 个")
 
     def _lift_dark_weak_pixels(self, data: np.ndarray, ksize: int = 3, threshold_ratio: float = 0.30) -> tuple[np.ndarray, int, float]:
         arr = np.asarray(data, dtype=np.float64)
@@ -663,14 +680,88 @@ class MainWindow(QMainWindow):
             slot = "a"
 
         lifted, count, threshold = self._lift_dark_weak_pixels(target, ksize=3, threshold_ratio=0.30)
+        changed_mask = np.isfinite(target) & np.isfinite(lifted) & (~np.isclose(lifted, target))
         if showing_aligned:
             self._disp_aligned = lifted
         else:
             self._disp_ref = lifted
         self._canvas.load_base_gray8(to_uint8_view(lifted), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        marked = self._mark_modified_pixels(changed_mask)
         self._set_op_status(
-            f"{target_name} 暗弱点提升完成 | 阈值: {threshold:.2f} (30%) | 提亮像素: {count} 个"
+            f"{target_name} 暗弱点提升完成 | 阈值: {threshold:.2f} (30%) | 提亮像素: {count} 个 | 标记: {marked} 个"
+        )
+
+    def _morph_opening_2d(self, data: np.ndarray, ksize: int = 9) -> np.ndarray:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2:
+            return arr
+        k = max(3, int(ksize))
+        if k % 2 == 0:
+            k += 1
+        pad = k // 2
+        fill_val = float(np.nanmedian(arr)) if np.isfinite(arr).any() else 0.0
+        work = arr.copy()
+        work[~np.isfinite(work)] = fill_val
+
+        padded = np.pad(work, ((pad, pad), (pad, pad)), mode="edge")
+        win = sliding_window_view(padded, (k, k))
+        erosion = np.min(win, axis=(-2, -1))
+
+        padded2 = np.pad(erosion, ((pad, pad), (pad, pad)), mode="edge")
+        win2 = sliding_window_view(padded2, (k, k))
+        opening = np.max(win2, axis=(-2, -1))
+        return opening
+
+    def _tophat_replace_small_objects(self, data: np.ndarray, ksize: int = 9) -> tuple[np.ndarray, np.ndarray, float]:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2:
+            return arr, np.zeros_like(arr, dtype=bool), 0.0
+
+        finite = np.isfinite(arr)
+        nonzero = finite & (arr != 0.0)
+        if not np.any(nonzero):
+            return arr.copy(), np.zeros_like(arr, dtype=bool), 0.0
+
+        opening = self._morph_opening_2d(arr, ksize=ksize)
+        tophat = arr - opening
+        eps = max(1e-12, 1e-6 * float(np.nanstd(arr[nonzero])))
+        small_obj_mask = nonzero & np.isfinite(tophat) & (tophat > eps)
+
+        nz_mean = float(np.mean(arr[nonzero]))
+        out = arr.copy()
+        out[small_obj_mask] = nz_mean
+        return out, small_obj_mask, nz_mean
+
+    def _tophat_replace_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+        ksize = 9
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self._set_op_status("当前无 aligned 图像可处理")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self._set_op_status("当前无 reference 图像可处理")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        replaced, obj_mask, nz_mean = self._tophat_replace_small_objects(target, ksize=ksize)
+        changed_count = int(np.count_nonzero(obj_mask))
+        if showing_aligned:
+            self._disp_aligned = replaced
+        else:
+            self._disp_ref = replaced
+        self._canvas.load_base_gray8(to_uint8_view(replaced), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        marked = self._mark_modified_pixels(obj_mask)
+        self._set_op_status(
+            f"{target_name} Tophat替换完成 | 均值: {nz_mean:.2f} | 替换像素: {changed_count} 个 | 标记: {marked} 个"
         )
 
     def _batch_process_and_export(self) -> None:
@@ -752,6 +843,7 @@ class MainWindow(QMainWindow):
         self._raw_aligned = None
         self._disp_ref = None
         self._disp_aligned = None
+        self._canvas.clear_modified_markers()
 
         if tile.reference:
             self._load_reference(tile.reference)
