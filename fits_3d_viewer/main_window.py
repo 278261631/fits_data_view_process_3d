@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -75,6 +77,9 @@ class MainWindow(QMainWindow):
         self._blinking = False
         self._compare_original = False
         self._active_bg_method = self._cfg.bg_method
+        self._tophat_ksize = 9
+        self._tophat_percentile = 70.0
+        self._tophat_max_area = 40
 
         self._build_ui()
         self._setup_shortcuts()
@@ -713,7 +718,45 @@ class MainWindow(QMainWindow):
         opening = np.max(win2, axis=(-2, -1))
         return opening
 
-    def _tophat_replace_small_objects(self, data: np.ndarray, ksize: int = 9) -> tuple[np.ndarray, np.ndarray, float]:
+    def _filter_components_by_area(self, mask: np.ndarray, min_area: int = 1, max_area: int = 64) -> np.ndarray:
+        src = np.asarray(mask, dtype=bool)
+        if src.ndim != 2:
+            return np.zeros_like(src, dtype=bool)
+        h, w = src.shape
+        visited = np.zeros((h, w), dtype=bool)
+        out = np.zeros((h, w), dtype=bool)
+        min_a = max(1, int(min_area))
+        max_a = max(min_a, int(max_area))
+        neighbors = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+        for y in range(h):
+            for x in range(w):
+                if not src[y, x] or visited[y, x]:
+                    continue
+                q: deque[tuple[int, int]] = deque()
+                comp: list[tuple[int, int]] = []
+                q.append((y, x))
+                visited[y, x] = True
+                while q:
+                    cy, cx = q.popleft()
+                    comp.append((cy, cx))
+                    for dy, dx in neighbors:
+                        ny, nx = cy + dy, cx + dx
+                        if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                            continue
+                        if visited[ny, nx] or not src[ny, nx]:
+                            continue
+                        visited[ny, nx] = True
+                        q.append((ny, nx))
+                area = len(comp)
+                if min_a <= area <= max_a:
+                    for py, px in comp:
+                        out[py, px] = True
+        return out
+
+    def _tophat_replace_small_objects(
+        self, data: np.ndarray, ksize: int = 9, percentile: float = 70.0, max_area: int = 40
+    ) -> tuple[np.ndarray, np.ndarray, float]:
         arr = np.asarray(data, dtype=np.float64)
         if arr.ndim != 2:
             return arr, np.zeros_like(arr, dtype=bool), 0.0
@@ -725,18 +768,74 @@ class MainWindow(QMainWindow):
 
         opening = self._morph_opening_2d(arr, ksize=ksize)
         tophat = arr - opening
+        pos_th = tophat[nonzero & np.isfinite(tophat) & (tophat > 0.0)]
+        if pos_th.size == 0:
+            return arr.copy(), np.zeros_like(arr, dtype=bool), float(np.mean(arr[nonzero]))
         eps = max(1e-12, 1e-6 * float(np.nanstd(arr[nonzero])))
-        small_obj_mask = nonzero & np.isfinite(tophat) & (tophat > eps)
+        p = float(np.clip(percentile, 1.0, 99.9))
+        th = max(eps, float(np.percentile(pos_th, p)))
+        candidate_mask = nonzero & np.isfinite(tophat) & (tophat >= th)
+        # 仅保留小面积连通域，避免大尺度结构被误检。
+        area_up = max(1, int(max_area))
+        small_obj_mask = self._filter_components_by_area(candidate_mask, min_area=1, max_area=area_up)
 
         nz_mean = float(np.mean(arr[nonzero]))
         out = arr.copy()
         out[small_obj_mask] = nz_mean
         return out, small_obj_mask, nz_mean
 
+    def _prompt_tophat_params(self) -> tuple[int, float, int] | None:
+        ksize, ok = QInputDialog.getInt(
+            self,
+            "Tophat参数",
+            "结构元素大小(奇数):",
+            int(self._tophat_ksize),
+            3,
+            101,
+            2,
+        )
+        if not ok:
+            return None
+        if ksize % 2 == 0:
+            ksize += 1
+
+        percentile, ok = QInputDialog.getDouble(
+            self,
+            "Tophat参数",
+            "响应分位数(1-99.9):",
+            float(self._tophat_percentile),
+            1.0,
+            99.9,
+            1,
+        )
+        if not ok:
+            return None
+
+        max_area, ok = QInputDialog.getInt(
+            self,
+            "Tophat参数",
+            "最大连通域面积(像素):",
+            int(self._tophat_max_area),
+            1,
+            50000,
+            1,
+        )
+        if not ok:
+            return None
+
+        self._tophat_ksize = int(ksize)
+        self._tophat_percentile = float(percentile)
+        self._tophat_max_area = int(max_area)
+        return self._tophat_ksize, self._tophat_percentile, self._tophat_max_area
+
     def _tophat_replace_current_view(self) -> None:
         showing_aligned = self._canvas.is_showing_aligned()
         target_name = "aligned" if showing_aligned else "reference"
-        ksize = 9
+        params = self._prompt_tophat_params()
+        if params is None:
+            self._set_op_status("Tophat替换已取消")
+            return
+        ksize, percentile, max_area = params
 
         if showing_aligned:
             if self._disp_aligned is None:
@@ -751,7 +850,12 @@ class MainWindow(QMainWindow):
             target = self._disp_ref
             slot = "a"
 
-        replaced, obj_mask, nz_mean = self._tophat_replace_small_objects(target, ksize=ksize)
+        replaced, obj_mask, nz_mean = self._tophat_replace_small_objects(
+            target,
+            ksize=ksize,
+            percentile=percentile,
+            max_area=max_area,
+        )
         changed_count = int(np.count_nonzero(obj_mask))
         if showing_aligned:
             self._disp_aligned = replaced
@@ -761,7 +865,8 @@ class MainWindow(QMainWindow):
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
         marked = self._mark_modified_pixels(obj_mask)
         self._set_op_status(
-            f"{target_name} Tophat替换完成 | 均值: {nz_mean:.2f} | 替换像素: {changed_count} 个 | 标记: {marked} 个"
+            f"{target_name} Tophat替换完成 | k={ksize} p={percentile:.1f}% area<={max_area} | "
+            f"均值: {nz_mean:.2f} | 替换像素: {changed_count} 个 | 标记: {marked} 个"
         )
 
     def _batch_process_and_export(self) -> None:
