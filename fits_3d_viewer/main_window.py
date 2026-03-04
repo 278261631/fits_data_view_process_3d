@@ -115,6 +115,18 @@ class MainWindow(QMainWindow):
         act_median_filter.triggered.connect(self._median_filter_current_view)
         tb.addAction(act_median_filter)
 
+        act_adaptive_hist_eq = QAction("自适应直方图均衡化", self)
+        act_adaptive_hist_eq.triggered.connect(self._adaptive_hist_eq_current_view)
+        tb.addAction(act_adaptive_hist_eq)
+
+        act_gamma_correction = QAction("Gamma校正", self)
+        act_gamma_correction.triggered.connect(self._gamma_correct_current_view)
+        tb.addAction(act_gamma_correction)
+
+        act_lift_dark_weak = QAction("暗弱点提升", self)
+        act_lift_dark_weak.triggered.connect(self._lift_dark_weak_pixels_current_view)
+        tb.addAction(act_lift_dark_weak)
+
         act_batch_export = QAction("批量处理导出", self)
         act_batch_export.triggered.connect(self._batch_process_and_export)
         tb.addAction(act_batch_export)
@@ -143,9 +155,11 @@ class MainWindow(QMainWindow):
 
         self._status_coord = QLabel("x=-, y=-")
         self._status_value = QLabel("")
+        self._status_info = QLabel("")
         self._status_file = QLabel("")
         self.statusBar().addWidget(self._status_coord, 0)
         self.statusBar().addWidget(self._status_value, 0)
+        self.statusBar().addWidget(self._status_info, 1)
         self.statusBar().addPermanentWidget(self._status_file, 1)
 
     def _build_method_panel(self) -> QWidget:
@@ -347,6 +361,12 @@ class MainWindow(QMainWindow):
         self._compare_original = bool(on)
         self._recompute_background_view()
 
+    def _set_op_status(self, message: str) -> None:
+        # 固定在状态栏标签显示，避免临时消息不易察觉或被覆盖。
+        self._status_info.setText(message)
+        self.statusBar().showMessage(message)
+        print(f"[FITS3D] {message}", flush=True)
+
     def _clip_negative_in_current_view(self) -> None:
         showing_aligned = self._canvas.is_showing_aligned()
         target_name = "aligned" if showing_aligned else "reference"
@@ -367,7 +387,7 @@ class MainWindow(QMainWindow):
         neg_mask = np.isfinite(target) & (target < 0.0)
         neg_count = int(np.count_nonzero(neg_mask))
         if neg_count <= 0:
-            self.statusBar().showMessage(f"{target_name} 图像中无负值像素")
+            self._set_op_status(f"{target_name} 图像中无负值像素")
             return
 
         clipped = np.array(target, copy=True)
@@ -379,7 +399,7 @@ class MainWindow(QMainWindow):
             self._disp_ref = clipped
         self._canvas.load_base_gray8(to_uint8_view(clipped), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self.statusBar().showMessage(f"{target_name} 负值置零完成: {neg_count} 个像素")
+        self._set_op_status(f"{target_name} 负值置零完成: {neg_count} 个像素")
 
     def _gaussian_smooth_current_view(self) -> None:
         showing_aligned = self._canvas.is_showing_aligned()
@@ -417,7 +437,7 @@ class MainWindow(QMainWindow):
             self._disp_ref = smoothed
         self._canvas.load_base_gray8(to_uint8_view(smoothed), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self.statusBar().showMessage(f"{target_name} 高斯平滑完成 (sigma={sigma})")
+        self._set_op_status(f"{target_name} 高斯平滑完成 (sigma={sigma})")
 
     def _median_filter_2d(self, data: np.ndarray, ksize: int = 3) -> np.ndarray:
         k = int(ksize)
@@ -464,7 +484,194 @@ class MainWindow(QMainWindow):
             self._disp_ref = filtered
         self._canvas.load_base_gray8(to_uint8_view(filtered), slot=slot)
         self._view3d.set_data(self._disp_ref, self._disp_aligned)
-        self.statusBar().showMessage(f"{target_name} 中值滤波完成 (ksize={ksize})")
+        self._set_op_status(f"{target_name} 中值滤波完成 (ksize={ksize})")
+
+    def _adaptive_hist_eq_2d(self, data: np.ndarray, tile_size: int = 64, clip_limit: float = 0.02) -> np.ndarray:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2:
+            return arr
+        finite = np.isfinite(arr)
+        if not np.any(finite):
+            return np.zeros_like(arr, dtype=np.float64)
+
+        vals = arr[finite]
+        lo = float(np.percentile(vals, 1.0))
+        hi = float(np.percentile(vals, 99.0))
+        if hi <= lo:
+            lo = float(np.min(vals))
+            hi = float(np.max(vals))
+            if hi <= lo:
+                return np.zeros_like(arr, dtype=np.float64)
+
+        norm = np.zeros_like(arr, dtype=np.float64)
+        norm[finite] = np.clip((arr[finite] - lo) / (hi - lo), 0.0, 1.0)
+        u8 = (norm * 255.0).astype(np.uint8)
+
+        h, w = u8.shape
+        ts = max(16, int(tile_size))
+        out_u8 = np.zeros_like(u8, dtype=np.uint8)
+
+        def _tile_lut(tile: np.ndarray) -> np.ndarray:
+            hist = np.bincount(tile.ravel(), minlength=256).astype(np.float64)
+            if clip_limit > 0.0:
+                clip_val = max(1.0, float(clip_limit) * float(tile.size))
+                excess = np.maximum(hist - clip_val, 0.0)
+                hist = np.minimum(hist, clip_val)
+                hist += excess.sum() / 256.0
+            cdf = np.cumsum(hist)
+            if cdf[-1] <= 0:
+                return np.arange(256, dtype=np.uint8)
+            cdf0 = cdf[0]
+            den = max(cdf[-1] - cdf0, 1e-12)
+            lut = np.floor((cdf - cdf0) / den * 255.0)
+            return np.clip(lut, 0.0, 255.0).astype(np.uint8)
+
+        for y0 in range(0, h, ts):
+            y1 = min(h, y0 + ts)
+            for x0 in range(0, w, ts):
+                x1 = min(w, x0 + ts)
+                tile = u8[y0:y1, x0:x1]
+                lut = _tile_lut(tile)
+                out_u8[y0:y1, x0:x1] = lut[tile]
+
+        out = lo + (out_u8.astype(np.float64) / 255.0) * (hi - lo)
+        out[~finite] = arr[~finite]
+        return out
+
+    def _adaptive_hist_eq_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+        tile_size = 64
+        clip_limit = 0.02
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可均衡化")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可均衡化")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        eq = self._adaptive_hist_eq_2d(target, tile_size=tile_size, clip_limit=clip_limit)
+        if showing_aligned:
+            self._disp_aligned = eq
+        else:
+            self._disp_ref = eq
+        self._canvas.load_base_gray8(to_uint8_view(eq), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self._set_op_status(
+            f"{target_name} 自适应直方图均衡化完成 (tile={tile_size}, clip={clip_limit})"
+        )
+
+    def _gamma_correct_2d(self, data: np.ndarray, gamma: float = 1.2) -> np.ndarray:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2:
+            return arr
+        g = max(0.05, float(gamma))
+        finite = np.isfinite(arr)
+        if not np.any(finite):
+            return np.zeros_like(arr, dtype=np.float64)
+
+        vals = arr[finite]
+        lo = float(np.percentile(vals, 1.0))
+        hi = float(np.percentile(vals, 99.0))
+        if hi <= lo:
+            lo = float(np.min(vals))
+            hi = float(np.max(vals))
+            if hi <= lo:
+                return arr.copy()
+
+        out = arr.copy()
+        x = np.clip((arr[finite] - lo) / (hi - lo), 0.0, 1.0)
+        y = np.power(x, g)
+        out[finite] = lo + y * (hi - lo)
+        return out
+
+    def _gamma_correct_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+        gamma = 1.2
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可Gamma校正")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可Gamma校正")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        corrected = self._gamma_correct_2d(target, gamma=gamma)
+        if showing_aligned:
+            self._disp_aligned = corrected
+        else:
+            self._disp_ref = corrected
+        self._canvas.load_base_gray8(to_uint8_view(corrected), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self._set_op_status(f"{target_name} Gamma校正完成 (gamma={gamma})")
+
+    def _lift_dark_weak_pixels(self, data: np.ndarray, ksize: int = 3, threshold_ratio: float = 0.30) -> tuple[np.ndarray, int, float]:
+        arr = np.asarray(data, dtype=np.float64)
+        if arr.ndim != 2:
+            return arr, 0, 0.0
+
+        finite = np.isfinite(arr)
+        nonzero = finite & (arr > 0.0)
+        if not np.any(nonzero):
+            return arr.copy(), 0, 0.0
+
+        # 按“非零像素亮度的30%”定义提升阈值。
+        nz_vals = arr[nonzero]
+        base = float(np.max(nz_vals))
+        threshold = max(0.0, float(threshold_ratio) * base)
+        if threshold <= 0.0:
+            return arr.copy(), 0, 0.0
+
+        med = self._median_filter_2d(arr, ksize=max(3, int(ksize)))
+        weak_mask = nonzero & (arr < threshold) & (arr < 0.8 * med)
+
+        out = arr.copy()
+        count = int(np.count_nonzero(weak_mask))
+        if count > 0:
+            out[weak_mask] = threshold
+        return out, count, threshold
+
+    def _lift_dark_weak_pixels_current_view(self) -> None:
+        showing_aligned = self._canvas.is_showing_aligned()
+        target_name = "aligned" if showing_aligned else "reference"
+
+        if showing_aligned:
+            if self._disp_aligned is None:
+                self.statusBar().showMessage("当前无 aligned 图像可处理")
+                return
+            target = self._disp_aligned
+            slot = "b"
+        else:
+            if self._disp_ref is None:
+                self.statusBar().showMessage("当前无 reference 图像可处理")
+                return
+            target = self._disp_ref
+            slot = "a"
+
+        lifted, count, threshold = self._lift_dark_weak_pixels(target, ksize=3, threshold_ratio=0.30)
+        if showing_aligned:
+            self._disp_aligned = lifted
+        else:
+            self._disp_ref = lifted
+        self._canvas.load_base_gray8(to_uint8_view(lifted), slot=slot)
+        self._view3d.set_data(self._disp_ref, self._disp_aligned)
+        self._set_op_status(
+            f"{target_name} 暗弱点提升完成 | 阈值: {threshold:.2f} (30%) | 提亮像素: {count} 个"
+        )
 
     def _batch_process_and_export(self) -> None:
         if not self._cfg.data_dir:
