@@ -11,6 +11,7 @@ import numpy as np
 from astropy.convolution import Gaussian2DKernel, convolve_fft
 from astropy.io import fits
 from astropy.stats import sigma_clip
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 FITS_SUFFIXES = {".fits", ".fit", ".fts"}
@@ -181,6 +182,25 @@ def _restore_nonfinite_mask(output: np.ndarray, original: np.ndarray) -> np.ndar
     return out
 
 
+def _median_filter_2d(data: np.ndarray, ksize: int = 3) -> np.ndarray:
+    k = int(ksize)
+    if k < 1:
+        k = 1
+    if k % 2 == 0:
+        k += 1
+    if k == 1:
+        return np.asarray(data, dtype=np.float64)
+
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim != 2:
+        return arr
+
+    pad = k // 2
+    padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="edge")
+    windows = sliding_window_view(padded, (k, k))
+    return np.median(windows, axis=(-2, -1))
+
+
 def _collect_fits_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for p in root.rglob("*"):
@@ -196,6 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output-dir", type=Path, default=None, help="输出目录（默认: 输入路径同级时间戳目录）")
     parser.add_argument("--box", type=int, default=48, help="mesh 分块大小，默认 48")
     parser.add_argument("--clip-sigma", type=float, default=3.0, help="sigma clip 阈值，默认 3.0")
+    parser.add_argument("--median-ksize", type=int, default=3, help="中值滤波核大小，默认 3（默认开启，设为 1 关闭）")
     parser.add_argument("--denoise-sigma", type=float, default=2.0, help="高斯去噪 sigma，默认 2.0")
     parser.add_argument("--mix-alpha", type=float, default=0.7, help="细节混合比例，默认 0.7")
     parser.add_argument("--keep-negative", action="store_true", help="保留负值（默认会将负值裁剪为 0）")
@@ -210,6 +231,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("输入文件不是 FITS（仅支持 .fits/.fit/.fts）")
     if args.box < 16:
         raise ValueError("box 需要 >= 16")
+    if args.median_ksize < 1:
+        raise ValueError("median-ksize 需要 >= 1")
     if not (1.5 <= args.clip_sigma <= 8.0):
         raise ValueError("clip-sigma 需要在 [1.5, 8.0] 范围内")
     if not (0.5 <= args.denoise_sigma <= 20.0):
@@ -246,6 +269,7 @@ def main() -> int:
         {
             "box": args.box,
             "clip_sigma": args.clip_sigma,
+            "median_ksize": args.median_ksize,
             "denoise_sigma": args.denoise_sigma,
             "mix_alpha": args.mix_alpha,
             "keep_negative": args.keep_negative,
@@ -260,8 +284,10 @@ def main() -> int:
             arr = np.squeeze(img.data).astype(np.float64)
             if arr.ndim != 2:
                 raise ValueError(f"仅支持 2D 图像，当前维度: {arr.shape}")
+            arr_work = _median_filter_2d(arr, ksize=args.median_ksize)
+            arr_work = _restore_nonfinite_mask(arr_work, arr)
             processed = process_recommended_pipeline(
-                arr,
+                arr_work,
                 box=args.box,
                 clip_sigma=args.clip_sigma,
                 denoise_sigma=args.denoise_sigma,
