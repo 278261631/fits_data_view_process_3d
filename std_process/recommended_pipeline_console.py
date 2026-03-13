@@ -210,10 +210,22 @@ def _collect_fits_files(root: Path) -> list[Path]:
     return files
 
 
+def _output_name_for_index(base_name: str, index: int, total: int) -> str:
+    p = Path(base_name)
+    ext = p.suffix.lower()
+    if ext not in FITS_SUFFIXES:
+        ext = ".fits"
+    stem = p.stem if p.stem else "output"
+    if total <= 1:
+        return f"{stem}{ext}"
+    digits = max(3, len(str(total)))
+    return f"{stem}_{index:0{digits}d}{ext}"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="std_process 独立推荐流程控制台工具")
     parser.add_argument("-i", "--input-path", required=True, type=Path, help="输入路径（FITS 文件全路径或目录）")
-    parser.add_argument("-o", "--output-dir", type=Path, default=None, help="输出目录（默认: 输入路径同级时间戳目录）")
+    parser.add_argument("-o", "--output-name", type=str, default=None, help="输出文件名（示例: result.fits）")
     parser.add_argument("--box", type=int, default=48, help="mesh 分块大小，默认 48")
     parser.add_argument("--clip-sigma", type=float, default=3.0, help="sigma clip 阈值，默认 3.0")
     parser.add_argument("--median-ksize", type=int, default=3, help="中值滤波核大小，默认 3（默认开启，设为 1 关闭）")
@@ -249,11 +261,11 @@ def main() -> int:
 
     input_path = args.input_path.resolve()
     is_single_file = input_path.is_file()
-    if args.output_dir is None:
+    if args.output_name is None:
         base_dir = input_path.parent if is_single_file else input_path
         output_root = base_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
     else:
-        output_root = args.output_dir.resolve()
+        output_root = input_path.parent if is_single_file else input_path
     output_root.mkdir(parents=True, exist_ok=True)
 
     fits_files = [input_path] if is_single_file else _collect_fits_files(input_path)
@@ -263,6 +275,8 @@ def main() -> int:
 
     print(f"[INFO] 输入路径: {input_path}")
     print(f"[INFO] 输出目录: {output_root}")
+    if args.output_name is not None:
+        print(f"[INFO] 输出文件名模板: {args.output_name}")
     print(f"[INFO] 文件总数: {len(fits_files)}")
     print(
         "[INFO] 参数:",
@@ -296,13 +310,17 @@ def main() -> int:
             out_data = _restore_nonfinite_mask(processed, arr)
             if not args.keep_negative:
                 out_data[np.isfinite(out_data) & (out_data < 0.0)] = 0.0
-            rel = Path(in_path.name) if is_single_file else in_path.relative_to(input_path)
-            out_path = output_root / rel
+            if args.output_name is None:
+                rel = Path(in_path.name) if is_single_file else in_path.relative_to(input_path)
+                out_path = output_root / rel
+            else:
+                filename = _output_name_for_index(args.output_name, idx, len(fits_files))
+                out_path = output_root / filename
             if out_path.exists() and not args.overwrite:
                 raise FileExistsError(f"输出文件已存在: {out_path}（可加 --overwrite）")
             write_fits_image(out_path, out_data, header=img.header, overwrite=True)
             ok_count += 1
-            print(f"[{idx}/{len(fits_files)}] OK   {rel}")
+            print(f"[{idx}/{len(fits_files)}] OK   {out_path.name}")
         except Exception as exc:
             fail_count += 1
             print(f"[{idx}/{len(fits_files)}] FAIL {in_path} -> {exc}")
