@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +10,7 @@ import numpy as np
 from astropy.convolution import Gaussian2DKernel, convolve_fft
 from astropy.io import fits
 from astropy.stats import sigma_clip
-from numpy.lib.stride_tricks import sliding_window_view
+from scipy.ndimage import median_filter, maximum_filter
 
 
 FITS_SUFFIXES = {".fits", ".fit", ".fts"}
@@ -51,11 +50,11 @@ def write_fits_image(path: str | Path, data: np.ndarray, header: Any | None = No
 
 
 def _fill_nan_with_median(x: np.ndarray) -> np.ndarray:
-    arr = np.asarray(x, dtype=np.float64)
+    arr = np.asarray(x, dtype=np.float32)
     out = arr.copy()
     m = np.isfinite(out)
     if not np.any(m):
-        return np.zeros_like(out, dtype=np.float64)
+        return np.zeros_like(out, dtype=np.float32)
     med = float(np.median(out[m]))
     out[~m] = med
     return out
@@ -64,54 +63,24 @@ def _fill_nan_with_median(x: np.ndarray) -> np.ndarray:
 def _upsample_bilinear(grid: np.ndarray, h: int, w: int) -> np.ndarray:
     gy, gx = grid.shape
     if gy == h and gx == w:
-        return grid.astype(np.float64, copy=False)
+        return grid.astype(np.float32, copy=False)
     x_src = np.linspace(0.0, 1.0, gx)
     y_src = np.linspace(0.0, 1.0, gy)
     x_dst = np.linspace(0.0, 1.0, w)
     y_dst = np.linspace(0.0, 1.0, h)
-    grid_x = np.empty((gy, w), dtype=np.float64)
+    grid_x = np.empty((gy, w), dtype=np.float32)
     for i in range(gy):
         grid_x[i, :] = np.interp(x_dst, x_src, grid[i, :])
-    out = np.empty((h, w), dtype=np.float64)
+    out = np.empty((h, w), dtype=np.float32)
     for j in range(w):
         out[:, j] = np.interp(y_dst, y_src, grid_x[:, j])
-    return out
-
-
-def _max_filter1d(x: np.ndarray, k: int) -> np.ndarray:
-    n = x.size
-    r = max(1, int(k))
-    if n == 0:
-        return x.copy()
-    pad = r // 2
-    xp = np.pad(x, (pad, pad), mode="edge")
-    out = np.empty(n, dtype=np.float64)
-    dq: deque[int] = deque()
-    for i in range(xp.size):
-        while dq and dq[0] <= i - r:
-            dq.popleft()
-        while dq and xp[dq[-1]] <= xp[i]:
-            dq.pop()
-        dq.append(i)
-        if i >= r - 1 and (i - r + 1) < n:
-            out[i - r + 1] = xp[dq[0]]
-    return out
-
-
-def _max_filter2d(img: np.ndarray, k: int) -> np.ndarray:
-    tmp = np.empty_like(img, dtype=np.float64)
-    out = np.empty_like(img, dtype=np.float64)
-    for y in range(img.shape[0]):
-        tmp[y, :] = _max_filter1d(img[y, :], k)
-    for x in range(img.shape[1]):
-        out[:, x] = _max_filter1d(tmp[:, x], k)
     return out
 
 
 def _estimate_source_mask(data: np.ndarray, sigma: float = 3.5, dilate_radius: int = 2) -> np.ndarray:
     img = _fill_nan_with_median(data)
     clipped = sigma_clip(img, sigma=3.0, maxiters=3, masked=True)
-    vals = np.asarray(clipped.compressed(), dtype=np.float64)
+    vals = np.asarray(clipped.compressed(), dtype=np.float32)
     if vals.size == 0:
         vals = img.reshape(-1)
     med = float(np.median(vals))
@@ -120,7 +89,7 @@ def _estimate_source_mask(data: np.ndarray, sigma: float = 3.5, dilate_radius: i
     src = img > (med + sigma * robust_std)
     if dilate_radius <= 0:
         return src
-    return _max_filter2d(src.astype(np.float64), 2 * dilate_radius + 1) > 0.5
+    return maximum_filter(src.astype(np.uint8), size=2 * dilate_radius + 1, mode="nearest") > 0
 
 
 def estimate_background_mesh(data: np.ndarray, box: int = 64, clip_sigma: float = 3.0) -> np.ndarray:
@@ -130,7 +99,7 @@ def estimate_background_mesh(data: np.ndarray, box: int = 64, clip_sigma: float 
     source_mask = _estimate_source_mask(img, sigma=max(2.5, clip_sigma), dilate_radius=2)
     ys = list(range(0, h, b))
     xs = list(range(0, w, b))
-    grid = np.zeros((len(ys), len(xs)), dtype=np.float64)
+    grid = np.zeros((len(ys), len(xs)), dtype=np.float32)
     for iy, y0 in enumerate(ys):
         y1 = min(h, y0 + b)
         for ix, x0 in enumerate(xs):
@@ -141,7 +110,7 @@ def estimate_background_mesh(data: np.ndarray, box: int = 64, clip_sigma: float 
             if patch_bg.size < max(16, (patch.size // 10)):
                 patch_bg = patch.reshape(-1)
             clipped = sigma_clip(patch_bg, sigma=clip_sigma, maxiters=3, masked=True)
-            vals = np.asarray(clipped.compressed(), dtype=np.float64)
+            vals = np.asarray(clipped.compressed(), dtype=np.float32)
             if vals.size == 0:
                 vals = patch_bg.reshape(-1)
             grid[iy, ix] = float(np.median(vals))
@@ -166,15 +135,15 @@ def process_recommended_pipeline(
             boundary="fill",
             fill_value=float(np.median(resid)),
         ),
-        dtype=np.float64,
+        dtype=np.float32,
     )
     a = float(np.clip(mix_alpha, 0.0, 1.0))
     mix = a * resid + (1.0 - a) * den
-    return mix
+    return np.asarray(mix, dtype=np.float32)
 
 
 def _restore_nonfinite_mask(output: np.ndarray, original: np.ndarray) -> np.ndarray:
-    out = np.asarray(output, dtype=np.float64).copy()
+    out = np.asarray(output, dtype=np.float32).copy()
     orig = np.asarray(original)
     nonfinite = ~np.isfinite(orig)
     if np.any(nonfinite):
@@ -189,16 +158,13 @@ def _median_filter_2d(data: np.ndarray, ksize: int = 3) -> np.ndarray:
     if k % 2 == 0:
         k += 1
     if k == 1:
-        return np.asarray(data, dtype=np.float64)
+        return np.asarray(data, dtype=np.float32)
 
-    arr = np.asarray(data, dtype=np.float64)
+    arr = np.asarray(data, dtype=np.float32)
     if arr.ndim != 2:
         return arr
 
-    pad = k // 2
-    padded = np.pad(arr, ((pad, pad), (pad, pad)), mode="edge")
-    windows = sliding_window_view(padded, (k, k))
-    return np.median(windows, axis=(-2, -1))
+    return median_filter(arr, size=k, mode="nearest")
 
 
 def _collect_fits_files(root: Path) -> list[Path]:
@@ -295,7 +261,7 @@ def main() -> int:
     for idx, in_path in enumerate(fits_files, start=1):
         try:
             img = read_fits_image(in_path)
-            arr = np.squeeze(img.data).astype(np.float64)
+            arr = np.squeeze(img.data).astype(np.float32)
             if arr.ndim != 2:
                 raise ValueError(f"仅支持 2D 图像，当前维度: {arr.shape}")
             arr_work = _median_filter_2d(arr, ksize=args.median_ksize)
